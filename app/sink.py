@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 from app.models import ChangeEvent, ChangeKind, NormalizedRecord
+from app.schema_versions import SchemaRegistry
 
 TABLE = "records"
 
@@ -62,10 +63,12 @@ class SchemaEvolutionError(Exception):
 class Sink:
     def __init__(self, db: sqlite3.Connection) -> None:
         self._db = db
+        self.registry = SchemaRegistry(db)
 
     def init_schema(self) -> None:
         for sql in _INIT_SQL:
             self._db.execute(sql)
+        self.registry.init_schema()
 
     # ---- 结构演进 ----
 
@@ -103,10 +106,20 @@ class Sink:
         return events
 
     def apply_declared_schema(self, spec: dict[str, type]) -> list[ChangeEvent]:
-        """应用声明式逻辑 schema：加列兼容，删列/改名显式拒绝。"""
+        """应用声明式逻辑 schema：加列兼容，删列/改名显式拒绝。
+
+        版本语义：
+        - 与当前生效版本完全一致：幂等 no-op，不产生新版本；
+        - 仅新增字段：兼容，登记为新版本（版本号接在当前版本之后）；
+        - 删字段/改名（含拿旧版本覆盖新版本）：显式拒绝，拒绝尝试记入
+          结构历史，当前版本与数据不受影响。
+        """
         rows = self._db.execute("SELECT name, type FROM declared_fields").fetchall()
         declared = {name: typ for name, typ in rows}
         incoming = {name: typ.__name__ for name, typ in spec.items()}
+
+        if incoming == declared and declared:
+            return []  # 重复声明当前版本：幂等 no-op
 
         removed = set(declared) - set(incoming)
         added = set(incoming) - set(declared)
@@ -117,15 +130,17 @@ class Sink:
                         ChangeKind.COLUMN_RENAME_REJECTED, name,
                         f"rename {name} -> {sorted(added)} rejected",
                     )
-                raise SchemaEvolutionError(
-                    f"column rename rejected: {sorted(removed)} -> {sorted(added)}"
-                )
+                detail = f"column rename rejected: {sorted(removed)} -> {sorted(added)}"
+                self.registry.record_rejected(incoming, detail)
+                raise SchemaEvolutionError(detail)
             for name in sorted(removed):
                 self._log_change(
                     ChangeKind.COLUMN_DROP_REJECTED, name,
                     f"drop column {name} rejected",
                 )
-            raise SchemaEvolutionError(f"column drop rejected: {sorted(removed)}")
+            detail = f"column drop rejected: {sorted(removed)}"
+            self.registry.record_rejected(incoming, detail)
+            raise SchemaEvolutionError(detail)
 
         events: list[ChangeEvent] = []
         for name, typ in incoming.items():
@@ -134,6 +149,9 @@ class Sink:
                     "INSERT INTO declared_fields (name, type) VALUES (?, ?)",
                     (name, typ),
                 )
+        self.registry.record_applied(
+            incoming, f"applied schema version with added columns: {sorted(added)}"
+        )
         return events
 
     # ---- 写入与读取 ----

@@ -17,9 +17,11 @@ import time
 
 from app.checkpoint import CheckpointStore
 from app.connectors.base import SourceConnector
+from app.history import KIND_INGEST, KIND_SCHEMA, init_op_log, record_op
 from app.models import BatchResult
 from app.normalize import FieldSpec, normalize_batch
-from app.sink import Sink
+from app.schema_versions import SchemaVersion, names_to_spec
+from app.sink import SchemaEvolutionError, Sink
 
 log = logging.getLogger("pipeline")
 
@@ -57,8 +59,53 @@ class Pipeline:
         self.checkpoints.init_schema()
         self.sink.init_schema()
         self._db.execute(_REJECT_SQL)
-        self.sink.apply_declared_schema(self._schema)
+        init_op_log(self._db)
+        current = self.sink.registry.current()
+        if current is None:
+            # 全新实例：以配置的结构建立版本 1
+            self.sink.apply_declared_schema(self._schema)
+        else:
+            # 重启恢复：继续按最新已生效版本运行，不回退到配置的旧结构
+            self._schema = names_to_spec(current.fields)
         self._db.commit()
+
+    def apply_schema(self, spec: FieldSpec) -> SchemaVersion | None:
+        """事务化结构变更：与摄入批次互斥串行，任一时刻只见到完整版本。
+
+        - 兼容变更：登记新版本、写操作流水后整体提交，返回新版本；
+        - 不兼容变更：sink 在变更任何数据/结构前显式拒绝，事务内只有
+          审计留痕（change_log/schema_history/op_log 的 rejected 条目），
+          提交这些留痕后抛 SchemaEvolutionError；数据、位点、当前版本
+          均停在变更前；
+        - 与当前版本一致的重复声明：no-op，返回当前版本。
+        """
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self.sink.apply_declared_schema(spec)
+            current = self.sink.registry.current()
+            record_op(self._db, KIND_SCHEMA, {
+                "fields": {k: v.__name__ for k, v in spec.items()},
+                "result": "applied",
+                "version": current.version if current else None,
+            })
+            self._db.execute("COMMIT")
+        except SchemaEvolutionError as exc:
+            record_op(self._db, KIND_SCHEMA, {
+                "fields": {k: v.__name__ for k, v in spec.items()},
+                "result": "rejected",
+                "version": None,
+            })
+            self._db.execute("COMMIT")  # 仅持久化拒绝留痕，无任何结构/数据变更
+            log.info("schema change rejected: %s", exc)
+            raise
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+        self._schema = dict(spec)
+        log.info("schema change applied: version=%s fields=%s",
+                 current.version if current else None,
+                 sorted(current.fields) if current else [])
+        return current
 
     def _persist_rejections(self, rejected: list) -> None:
         now = time.time()
@@ -93,6 +140,10 @@ class Pipeline:
             result.changes = changes
             last_offset = max(r.offset for r in raws)
             result.checkpoint = self.checkpoints.commit(source, last_offset)
+            record_op(self._db, KIND_INGEST, {
+                "source": source,
+                "raws": [{"offset": r.offset, "payload": r.payload} for r in raws],
+            })
             self._db.execute("COMMIT")
         except Exception:
             self._db.execute("ROLLBACK")

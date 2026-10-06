@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -14,6 +15,7 @@ from pydantic import BaseModel
 from app.checkpoint import OffsetRegressionError
 from app.connectors.csv_source import CsvConnector
 from app.connectors.jsonl import JsonlConnector
+from app.history import export_history
 from app.pipeline import Pipeline, connect_db
 from app.sink import SchemaEvolutionError
 
@@ -106,19 +108,60 @@ def create_app(db_path: str | None = None, schema: dict[str, type] | None = None
         ]
 
     @app.post("/schema")
-    def update_schema(spec: SchemaIn) -> dict[str, str]:
+    def update_schema(spec: SchemaIn) -> dict[str, Any]:
         try:
             incoming = {k: _TYPE_NAMES[v] for k, v in spec.fields.items()}
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=f"unknown type: {exc}") from exc
         try:
-            pipeline.sink.apply_declared_schema(incoming)
-            db.commit()
+            version = pipeline.apply_schema(incoming)
         except SchemaEvolutionError as exc:
-            db.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        pipeline._schema = incoming
-        return {"status": "ok"}
+        return {"status": "ok",
+                "version": version.version if version else None}
+
+    @app.get("/schema/version")
+    def current_version() -> dict[str, Any]:
+        current = pipeline.sink.registry.current()
+        if current is None:
+            return {"version": None, "fields": {}}
+        return {"version": current.version, "fields": current.fields}
+
+    @app.get("/schema/versions")
+    def versions() -> list[dict[str, Any]]:
+        return [
+            {"version": v.version, "fields": v.fields}
+            for v in pipeline.sink.registry.versions()
+        ]
+
+    @app.get("/schema/history")
+    def schema_history() -> list[dict[str, Any]]:
+        return [
+            {"seq": e.seq, "version": e.version, "status": e.status,
+             "fields": e.fields, "detail": e.detail}
+            for e in pipeline.sink.registry.history()
+        ]
+
+    @app.get("/history/export")
+    def export() -> dict[str, Any]:
+        return export_history(db)
+
+    @app.post("/history/replay")
+    def replay() -> dict[str, Any]:
+        """在全新临时实例上重放导出历史并逐项比对，返回比对报告。"""
+        import tempfile
+
+        from app.history import replay_history, verify_replay
+
+        exported = export_history(db)
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh_db = connect_db(str(Path(tmp) / "replay.db"))
+            fresh = Pipeline(fresh_db, dict(schema or DEFAULT_SCHEMA))
+            fresh.init()
+            replay_history(fresh, exported)
+            report = verify_replay(db, fresh_db)
+            fresh_db.close()
+        return report
 
     return app
 

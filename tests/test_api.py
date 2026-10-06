@@ -62,3 +62,37 @@ def test_schema_update_rules_over_http(tmp_path):
     assert r.status_code == 409 and "rename" in r.json()["detail"]
     kinds = [c["kind"] for c in client.get("/changes").json()]
     assert "column_drop_rejected" in kinds and "column_rename_rejected" in kinds
+
+
+def test_schema_versions_and_replay_over_http(tmp_path):
+    src = tmp_path / "src.jsonl"
+    src.write_text(
+        json.dumps({"id": "a", "name": "alice"}) + "\n"
+        + json.dumps({"id": "b", "name": "bob"}) + "\n",
+        encoding="utf-8",
+    )
+    client = _client(tmp_path)
+    client.post("/sources", json={"type": "jsonl", "path": str(src), "name": "api"})
+    client.post("/ingest/api")
+
+    # 初始版本 1
+    assert client.get("/schema/version").json()["version"] == 1
+    # 兼容变更 -> 版本 2
+    r = client.post("/schema", json={"fields": {"id": "str", "name": "str", "age": "int"}})
+    assert r.status_code == 200 and r.json()["version"] == 2
+    # 不兼容变更 -> 409，且留痕
+    r = client.post("/schema", json={"fields": {"id": "str"}})
+    assert r.status_code == 409
+    history = client.get("/schema/history").json()
+    assert [h["status"] for h in history] == ["applied", "applied", "rejected"]
+    assert [v["version"] for v in client.get("/schema/versions").json()] == [1, 2]
+
+    # 导出历史并在干净实例上重放，逐项一致
+    exported = client.get("/history/export").json()
+    assert [op["kind"] for op in exported["ops"]] == [
+        "ingest", "schema", "schema",
+    ]
+    report = client.post("/history/replay").json()
+    assert report["ok"], report["mismatches"]
+    assert report["counts"]["records"] == 2
+    print("HTTP 重放比对:", report["counts"])
