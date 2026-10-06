@@ -16,6 +16,8 @@ FieldSpec = dict[str, type]
 
 ID_FIELD = "id"
 
+TYPE_NAMES: dict[str, type] = {"str": str, "int": int, "float": float, "bool": bool}
+
 
 def _coerce(value: Any, target: type) -> tuple[bool, Any]:
     """安全类型强转；返回 (是否成功, 强转后的值)。"""

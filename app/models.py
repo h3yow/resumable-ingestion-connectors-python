@@ -82,3 +82,43 @@ class BatchResult:
     rejected: list[RejectedRecord] = field(default_factory=list)
     changes: list[ChangeEvent] = field(default_factory=list)
     checkpoint: Checkpoint | None = None
+
+
+class SchemaStatus(str, enum.Enum):
+    """一次结构变更尝试的结果。"""
+
+    APPLIED = "applied"    # 兼容变更，已生效并分配新版本号
+    REJECTED = "rejected"  # 不兼容变更或旧版本覆盖，已拒绝并留痕
+
+
+@dataclass(frozen=True)
+class SchemaVersion:
+    """结构版本历史条目。
+
+    version 仅对 applied 条目分配，从 1 开始严格递增、不跳号；
+    rejected 条目 version 为 None，仅留痕。
+    """
+
+    seq: int
+    status: SchemaStatus
+    fields: dict[str, str]  # 字段名 -> 类型名
+    detail: str
+    version: int | None = None
+    at: float = field(default_factory=time.time)
+
+
+class OpKind(str, enum.Enum):
+    """历史操作类型。"""
+
+    INGEST = "ingest"  # 一次摄入批次
+    SCHEMA = "schema"  # 一次结构变更尝试（含被拒绝的）
+
+
+@dataclass(frozen=True)
+class OpRecord:
+    """历史操作流水条目，seq 为真实发生顺序，可用于导出与重放。"""
+
+    seq: int
+    kind: OpKind
+    payload: dict[str, Any]
+    at: float = field(default_factory=time.time)

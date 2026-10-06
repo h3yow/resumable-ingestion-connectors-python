@@ -62,3 +62,36 @@ def test_schema_update_rules_over_http(tmp_path):
     assert r.status_code == 409 and "rename" in r.json()["detail"]
     kinds = [c["kind"] for c in client.get("/changes").json()]
     assert "column_drop_rejected" in kinds and "column_rename_rejected" in kinds
+
+
+def test_schema_version_and_history_over_http(tmp_path):
+    client = _client(tmp_path)
+
+    r = client.get("/schema")
+    assert r.json()["version"] == 1
+    assert r.json()["fields"] == {"id": "str", "name": "str"}
+
+    # 兼容变更 -> v2
+    r = client.post("/schema", json={
+        "fields": {"id": "str", "name": "str", "age": "int"}})
+    assert r.status_code == 200 and r.json() == {"status": "ok", "version": 2}
+
+    # 过期基线覆盖：明确拒绝
+    r = client.post("/schema", json={
+        "fields": {"id": "str", "name": "str", "nick": "str"}, "base_version": 1})
+    assert r.status_code == 409 and "stale" in r.json()["detail"]
+
+    # 不兼容变更：明确拒绝
+    r = client.post("/schema", json={"fields": {"id": "str", "name": "str"}})
+    assert r.status_code == 409 and "drop" in r.json()["detail"]
+
+    history = client.get("/schema/history").json()
+    assert [(e["version"], e["status"]) for e in history] == [
+        (1, "applied"), (2, "applied"), (None, "rejected"), (None, "rejected"),
+    ]
+    # 操作流水含全部结构变更尝试（含被拒绝的），按真实顺序
+    ops = client.get("/history").json()
+    assert [op["kind"] for op in ops] == ["schema", "schema", "schema"]
+    assert [op["payload"]["status"] for op in ops] == [
+        "applied", "rejected", "rejected",
+    ]

@@ -17,9 +17,11 @@ import time
 
 from app.checkpoint import CheckpointStore
 from app.connectors.base import SourceConnector
-from app.models import BatchResult
-from app.normalize import FieldSpec, normalize_batch
-from app.sink import Sink
+from app.history import HistoryRecorder
+from app.models import BatchResult, OpKind, SchemaVersion
+from app.normalize import TYPE_NAMES, FieldSpec, normalize_batch
+from app.schema_version import StaleSchemaVersionError
+from app.sink import SchemaEvolutionError, Sink
 
 log = logging.getLogger("pipeline")
 
@@ -52,13 +54,79 @@ class Pipeline:
         self._schema = schema
         self.checkpoints = CheckpointStore(db)
         self.sink = Sink(db)
+        self.history = HistoryRecorder(db)
 
     def init(self) -> None:
         self.checkpoints.init_schema()
         self.sink.init_schema()
+        self.history.init_schema()
         self._db.execute(_REJECT_SQL)
-        self.sink.apply_declared_schema(self._schema)
+        existing = self.sink.registry.current_fields()
+        if existing is not None:
+            # 重启：继续按最新已生效版本运行，不退回旧结构
+            self._schema = {name: TYPE_NAMES[t] for name, t in existing.items()}
+            log.info("init: resume at schema v%d fields=%s",
+                     self.sink.registry.current_version(), sorted(existing))
+        else:
+            # 首次启动：以传入 schema 建立 v1
+            self.sink.apply_declared_schema(self._schema)
+            if self.sink.registry.current_version() == 0:
+                self.sink.registry.record_applied(
+                    {k: v.__name__ for k, v in self._schema.items()},
+                    "initial schema",
+                )
+            log.info("init: established schema v1 fields=%s", sorted(self._schema))
         self._db.commit()
+
+    def apply_schema(self, spec: FieldSpec, base_version: int | None = None) -> SchemaVersion:
+        """事务化结构变更：任一时刻只观察到完整版本，失败整体不生效。
+
+        - 兼容变更（新增列）：分配紧随当前版本的新版本号并写入历史；
+        - 不兼容变更 / 旧版本覆盖 / base_version 过期：显式拒绝，拒绝尝试
+          留痕后提交（可审计），结构、位点与数据保持变更前状态；
+        - 意外异常：整体回滚，不留半提交状态。
+        """
+        incoming = {k: v.__name__ for k, v in spec.items()}
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.sink.registry.current_version()
+            if base_version is not None and base_version != current:
+                detail = f"stale base_version v{base_version}, current is v{current}"
+                self.sink.registry.record_rejected(incoming, detail)
+                self.history.record(OpKind.SCHEMA, {
+                    "fields": incoming, "status": "rejected", "detail": detail,
+                    "base_version": base_version,
+                })
+                self._db.execute("COMMIT")
+                raise StaleSchemaVersionError(detail)
+            try:
+                entry = self.sink.apply_declared_schema(spec)
+            except (SchemaEvolutionError, StaleSchemaVersionError) as exc:
+                self.history.record(OpKind.SCHEMA, {
+                    "fields": incoming, "status": "rejected", "detail": str(exc),
+                    "base_version": base_version,
+                })
+                self._db.execute("COMMIT")  # 拒绝留痕需持久化
+                raise
+            if entry is not None:
+                self.history.record(OpKind.SCHEMA, {
+                    "fields": incoming, "status": "applied",
+                    "version": entry.version, "detail": entry.detail,
+                    "base_version": base_version,
+                })
+            self._db.execute("COMMIT")
+        except Exception:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            raise
+        self._schema = dict(spec)
+        if entry is None:  # 幂等 no-op：返回当前已生效版本
+            entry = [e for e in self.sink.registry.history()
+                     if e.version is not None][-1]
+            log.info("schema unchanged at v%d (no-op)", entry.version)
+        else:
+            log.info("schema applied v%d fields=%s", entry.version, sorted(incoming))
+        return entry
 
     def _persist_rejections(self, rejected: list) -> None:
         now = time.time()
@@ -93,6 +161,16 @@ class Pipeline:
             result.changes = changes
             last_offset = max(r.offset for r in raws)
             result.checkpoint = self.checkpoints.commit(source, last_offset)
+            self.history.record(OpKind.INGEST, {
+                "source": source,
+                "from_offset": start.last_offset,
+                "to_offset": last_offset,
+                "records": len(raws),
+                "accepted": result.accepted,
+                "rejected": [
+                    {"offset": r.offset, "reason": r.reason.value} for r in rejected
+                ],
+            })
             self._db.execute("COMMIT")
         except Exception:
             self._db.execute("ROLLBACK")

@@ -17,7 +17,8 @@ import sqlite3
 import time
 from typing import Any
 
-from app.models import ChangeEvent, ChangeKind, NormalizedRecord
+from app.models import ChangeEvent, ChangeKind, NormalizedRecord, SchemaVersion
+from app.schema_version import SchemaRegistry
 
 TABLE = "records"
 
@@ -62,10 +63,12 @@ class SchemaEvolutionError(Exception):
 class Sink:
     def __init__(self, db: sqlite3.Connection) -> None:
         self._db = db
+        self.registry = SchemaRegistry(db)
 
     def init_schema(self) -> None:
         for sql in _INIT_SQL:
             self._db.execute(sql)
+        self.registry.init_schema()
 
     # ---- 结构演进 ----
 
@@ -102,39 +105,53 @@ class Sink:
                 existing.add(name)
         return events
 
-    def apply_declared_schema(self, spec: dict[str, type]) -> list[ChangeEvent]:
-        """应用声明式逻辑 schema：加列兼容，删列/改名显式拒绝。"""
+    def apply_declared_schema(self, spec: dict[str, type]) -> SchemaVersion | None:
+        """应用声明式逻辑 schema：加列兼容并产生新版本，删列/改名显式拒绝。
+
+        拒绝与生效都会写入结构版本历史（schema_history）；无实际变化时不产生新版本。
+        旧版本结构是当前版本的子集，覆盖尝试按删列规则被显式拒绝。
+        返回新版本的历史条目；无变化（幂等 no-op）时返回 None。
+        """
+        incoming = {name: typ.__name__ for name, typ in spec.items()}
+
         rows = self._db.execute("SELECT name, type FROM declared_fields").fetchall()
         declared = {name: typ for name, typ in rows}
-        incoming = {name: typ.__name__ for name, typ in spec.items()}
 
         removed = set(declared) - set(incoming)
         added = set(incoming) - set(declared)
         if removed:
             if added:
+                detail = f"rename {sorted(removed)} -> {sorted(added)} rejected"
                 for name in sorted(removed):
                     self._log_change(
                         ChangeKind.COLUMN_RENAME_REJECTED, name,
                         f"rename {name} -> {sorted(added)} rejected",
                     )
+                self.registry.record_rejected(incoming, detail)
                 raise SchemaEvolutionError(
                     f"column rename rejected: {sorted(removed)} -> {sorted(added)}"
                 )
+            detail = f"drop column {sorted(removed)} rejected"
             for name in sorted(removed):
                 self._log_change(
                     ChangeKind.COLUMN_DROP_REJECTED, name,
                     f"drop column {name} rejected",
                 )
+            self.registry.record_rejected(incoming, detail)
             raise SchemaEvolutionError(f"column drop rejected: {sorted(removed)}")
 
-        events: list[ChangeEvent] = []
+        if not added:
+            return None  # 与当前声明一致：幂等 no-op，不产生新版本
+
         for name, typ in incoming.items():
             if name not in declared:
                 self._db.execute(
                     "INSERT INTO declared_fields (name, type) VALUES (?, ?)",
                     (name, typ),
                 )
-        return events
+        return self.registry.record_applied(
+            incoming, f"added columns {sorted(added)}"
+        )
 
     # ---- 写入与读取 ----
 

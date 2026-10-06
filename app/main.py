@@ -14,12 +14,12 @@ from pydantic import BaseModel
 from app.checkpoint import OffsetRegressionError
 from app.connectors.csv_source import CsvConnector
 from app.connectors.jsonl import JsonlConnector
+from app.normalize import TYPE_NAMES
 from app.pipeline import Pipeline, connect_db
+from app.schema_version import StaleSchemaVersionError
 from app.sink import SchemaEvolutionError
 
 DEFAULT_SCHEMA: dict[str, type] = {"id": str, "name": str}
-
-_TYPE_NAMES = {"str": str, "int": int, "float": float, "bool": bool}
 
 
 class SourceIn(BaseModel):
@@ -30,6 +30,7 @@ class SourceIn(BaseModel):
 
 class SchemaIn(BaseModel):
     fields: dict[str, str]  # 字段名 -> 类型名（str/int/float/bool）
+    base_version: int | None = None  # 乐观并发：客户端基于的版本号，过期则 409
 
 
 def _make_connector(spec: SourceIn):
@@ -106,19 +107,39 @@ def create_app(db_path: str | None = None, schema: dict[str, type] | None = None
         ]
 
     @app.post("/schema")
-    def update_schema(spec: SchemaIn) -> dict[str, str]:
+    def update_schema(spec: SchemaIn) -> dict[str, Any]:
         try:
-            incoming = {k: _TYPE_NAMES[v] for k, v in spec.fields.items()}
+            incoming = {k: TYPE_NAMES[v] for k, v in spec.fields.items()}
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=f"unknown type: {exc}") from exc
         try:
-            pipeline.sink.apply_declared_schema(incoming)
-            db.commit()
-        except SchemaEvolutionError as exc:
-            db.rollback()
+            entry = pipeline.apply_schema(incoming, base_version=spec.base_version)
+        except (SchemaEvolutionError, StaleSchemaVersionError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        pipeline._schema = incoming
-        return {"status": "ok"}
+        return {"status": "ok", "version": entry.version}
+
+    @app.get("/schema")
+    def current_schema() -> dict[str, Any]:
+        return {
+            "version": pipeline.sink.registry.current_version(),
+            "fields": pipeline.sink.registry.current_fields(),
+        }
+
+    @app.get("/schema/history")
+    def schema_history() -> list[dict[str, Any]]:
+        return [
+            {"seq": e.seq, "version": e.version, "status": e.status.value,
+             "fields": e.fields, "detail": e.detail}
+            for e in pipeline.sink.registry.history()
+        ]
+
+    @app.get("/history")
+    def export_history() -> list[dict[str, Any]]:
+        """导出全部历史操作（摄入与结构变更，按真实发生顺序），可用于重放。"""
+        return [
+            {"seq": op.seq, "kind": op.kind.value, "payload": op.payload}
+            for op in pipeline.history.export()
+        ]
 
     return app
 
